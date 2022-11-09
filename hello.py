@@ -27,6 +27,8 @@ import logging
 import os, sys, subprocess, select, random, urllib.request, time, json, tempfile, shutil, copy
 import posixpath
 from argparse import ArgumentParser
+from datetime import datetime
+from contextlib import contextmanager
 
 NGINX_PORT = 20000
 IOJS_PORT = 20001
@@ -103,14 +105,40 @@ def tmp_copy(src):
     return dst
 
 
+def get_current_time():
+    return datetime.now()
+
+
+def delta_time(t_end, t_start):
+    delta = t_end - t_start
+    return delta.total_seconds(), delta.microseconds
+
+
+@contextmanager
+def timer(slogan):
+    start = get_current_time()
+    try:
+        rc = os.system(slogan)
+        assert rc == 0
+        end = get_current_time()
+        sec, usec = delta_time(end, start)
+        yield sec + usec / 1e9
+        logging.info("%s, Takes time %u.%u seconds", slogan, sec, usec // 1000)
+    finally:
+        pass
+
+
 class RunArgs:
-    def __init__(self, env={}, arg="", stdin="", stdin_sh="sh", waitline="", mount=[]):
+    def __init__(
+        self, env={}, arg="", stdin="", stdin_sh="sh", waitline="", mount=[], waitURL=""
+    ):
         self.env = env
         self.arg = arg
         self.stdin = stdin
         self.stdin_sh = stdin_sh
         self.waitline = waitline
         self.mount = mount
+        self.waitURL = waitURL
 
 
 class Docker:
@@ -233,7 +261,7 @@ class BenchRunner:
             waitline="mariadbd: ready for connections",
         ),
         "postgres": RunArgs(waitline="database system is ready to accept connections"),
-        "redis": RunArgs(waitline="server is now ready to accept connections"),
+        "redis": RunArgs(waitline="Ready to accept connections"),
         "crate": RunArgs(waitline="started"),
         "rethinkdb": RunArgs(waitline="Server ready"),
         "ghost": RunArgs(waitline="Listening on"),
@@ -248,7 +276,7 @@ class BenchRunner:
         "php-zendserver": RunArgs(waitline="Zend Server started"),
         "rabbitmq": RunArgs(waitline="Server startup complete"),
         "sonarqube": RunArgs(waitline="Process[web] is up"),
-        "tomcat": RunArgs(waitline="Server startup"),
+        "tomcat": RunArgs(arg="catalina.sh run", waitline="Server startup"),
     }
 
     CMD_STDIN = {
@@ -277,6 +305,9 @@ class BenchRunner:
         "thrift": RunArgs(
             stdin="cd /src; thrift --gen py hello.idl", mount=[("thrift", "/src")]
         ),
+        "benchmark": RunArgs(
+            stdin='sed -i "s/.cuda()//g" /benchmark/vision/test.py; sed -i "s/cuda/cpu/g" /benchmark/vision/test.py; sed -i "/^  assert/d" /benchmark/vision/test.py; sed -i "s/required=True/required=False/g" /benchmark/vision/test.py; sed -i "s/20/1/g" /benchmark/vision/test.py; cd /benchmark; python /benchmark/vision/test.py'
+        ),
     }
 
     CMD_ARG = {
@@ -287,12 +318,21 @@ class BenchRunner:
         "hello-world": RunArgs(),
     }
 
-    # values are function names
-    CUSTOM = {
-        "nginx": "run_nginx",
-        "iojs": "run_iojs",
-        "node": "run_node",
-        "registry": "run_registry",
+    CMD_URL_WAIT = {
+        "nginx": RunArgs(waitURL="http://localhost:80"),
+        "iojs": RunArgs(
+            arg="iojs /src/index.js",
+            mount=[("iojs", "/src")],
+            waitURL="http://localhost:80",
+        ),
+        "node": RunArgs(
+            arg="node /src/index.js",
+            mount=[("node", "/src")],
+            waitURL="http://localhost:80",
+        ),
+        "registry": RunArgs(
+            env={"GUNICORN_OPTS": '["--preload"]'}, waitURL="http://localhost:5000"
+        ),
     }
 
     # complete listing
@@ -337,6 +377,7 @@ class BenchRunner:
                 Bench("r-base", "language"),
                 Bench("gcc", "language"),
                 Bench("thrift", "language"),
+                Bench("benchmark"),
                 Bench("cassandra", "database"),
                 Bench("mongo", "database"),
                 Bench("elasticsearch", "database"),
@@ -367,6 +408,8 @@ class BenchRunner:
         registry="localhost:5000",
         registry2="localhost:5000",
         snapshotter="overlayfs",
+        optimizer=None,
+        cleanup=True,
     ):
         self.registry = registry
         if self.registry != "":
@@ -380,37 +423,101 @@ class BenchRunner:
         self.docker = Docker(bin=docker)
         if "nerdctl" == docker:
             self.docker.set_snapshotter(snapshotter)
+        self.optimizer = optimizer
+        self.cleanup = cleanup
 
     def image_ref(self, repo):
         return posixpath.join(self.registry, repo)
 
     def run_echo_hello(self, repo):
         image_ref = self.image_ref(repo)
-        docker = self.docker
-        docker.set_image(image_ref).run(run_cmd_args="echo hello")
+        container_id = repo.replace(":", "-")
+
+        pull_cmd = self.pull_cmd(image_ref)
+        print(pull_cmd)
+
+        print("Pulling image %s ..." % image_ref)
+        with timer(pull_cmd) as time:
+            pull_time = time
+
+        create_cmd = self.create_echo_hello_cmd(image_ref, container_id)
+        print(create_cmd)
+
+        print("Creating container for image %s ..." % image_ref)
+        with timer(create_cmd) as time:
+            create_time = time
+
+        run_cmd = self.task_start_cmd(container_id, iteration=False)
+        print(run_cmd)
+
+        print("Running container %s ..." % container_id)
+        with timer(run_cmd) as time:
+            run_time = time
+        if self.cleanup:
+            self.clean_up(image_ref, container_id)
+
+        return pull_time, create_time, run_time
 
     def run_cmd_arg(self, repo, runargs):
         assert len(runargs.mount) == 0
 
         image_ref = self.image_ref(repo)
-        docker = self.docker
-        docker.set_image(image_ref).run(run_cmd_args=runargs.arg)
+        container_id = repo.replace(":", "-")
 
-    def run_cmd_arg_wait(self, tagged: str, runargs):
-        repo = tagged.split(":")[0]
-        name = "%s_bench_%d" % (repo, random.randint(1, 1000000))
+        pull_cmd = self.pull_cmd(image_ref)
+        print(pull_cmd)
 
-        envs = [(k, v) for k, v in runargs.env.items()]
+        print("Pulling image %s ..." % image_ref)
+        with timer(pull_cmd) as time:
+            pull_time = time
+
+        create_cmd = self.create_cmd_arg_cmd(image_ref, container_id, runargs)
+        print(create_cmd)
+
+        print("Creating container for image %s ..." % image_ref)
+        with timer(create_cmd) as time:
+            create_time = time
+
+        run_cmd = self.task_start_cmd(container_id, iteration=False)
+        print(run_cmd)
+
+        with timer(run_cmd) as time:
+            run_time = time
+
+        if self.cleanup:
+            self.clean_up(image_ref, container_id)
+
+        return pull_time, create_time, run_time
+
+    def run_cmd_arg_wait(self, repo, runargs):
+        image_ref = self.image_ref(repo)
+        container_id = repo.replace(":", "-")
+
+        pull_cmd = self.pull_cmd(image_ref)
+        print(pull_cmd)
+
+        print("Pulling image %s ..." % image_ref)
+        with timer(pull_cmd) as time:
+            pull_time = time
+
+        create_cmd = self.create_cmd_arg_wait_cmd(image_ref, container_id, runargs)
+        print(create_cmd)
+
+        print("Creating container for image %s ..." % image_ref)
+        with timer(create_cmd) as time:
+            create_time = time
+
+        run_cmd = self.task_start_cmd(container_id, iteration=True)
+        print(run_cmd)
 
         r, w = os.pipe()
         reader = os.fdopen(r)
         writer = os.fdopen(w)
 
-        image_ref = self.image_ref(tagged)
-        docker = self.docker
-        p = docker.set_image(image_ref).run(
-            name=name, envs=envs, background=True, stdout=writer
-        )
+        print("Running container %s ..." % container_id)
+        start_run = datetime.now()
+
+        p = subprocess.Popen(run_cmd, shell=True, stdout=writer, stderr=writer)
 
         while True:
             l = reader.readline()
@@ -418,155 +525,249 @@ class BenchRunner:
                 continue
             print("out: " + l.strip())
             # are we done?
-            ra = l.find(runargs.waitline)
             if l.find(runargs.waitline) >= 0:
-                # cleanup
+                end_run = datetime.now()
+                run_time = datetime.timestamp(end_run) - datetime.timestamp(start_run)
                 print("DONE")
-                docker.kill(name)
                 break
+        print("Run time: %f s" % run_time)
+
+        if self.cleanup:
+            self.clean_up(image_ref, container_id)
+
+        return pull_time, create_time, run_time
 
     def run_cmd_stdin(self, repo, runargs):
         image_ref = self.image_ref(repo)
-        docker = self.docker
-        docker.set_image(image_ref)
-        volumes = []
+        container_id = repo.replace(":", "-")
 
-        for a, b in runargs.mount:
-            a = os.path.join(os.path.dirname(os.path.abspath(__file__)), a)
-            a = tmp_copy(a)
-            volumes.append((a, b))
+        pull_cmd = self.pull_cmd(image_ref)
+        print(pull_cmd)
 
-        if runargs.stdin_sh:
-            run_cmd_args = runargs.stdin_sh  # e.g., sh -c
-        else:
-            run_cmd_args = None
+        print("Pulling image %s ..." % image_ref)
+        with timer(pull_cmd) as time:
+            pull_time = time
 
-        docker.run(
-            run_cmd_args=run_cmd_args,
-            enable_stdin=True,
-            volumes=volumes,
-            stdin=runargs.stdin.encode() if runargs.stdin else None,
+        create_cmd = self.create_cmd_stdin_cmd(image_ref, container_id, runargs)
+        print(create_cmd)
+
+        print("Creating container for image %s ..." % image_ref)
+        with timer(create_cmd) as time:
+            create_time = time
+
+        run_cmd = self.task_start_cmd(container_id, iteration=True)
+        print(run_cmd)
+
+        print("Running container %s ..." % container_id)
+        start_run = datetime.now()
+
+        p = subprocess.Popen(
+            run_cmd,
+            shell=True,
+            stdin=subprocess.PIPE,
+            stdout=sys.stdout,
+            stderr=sys.stdout,
+            bufsize=0,
         )
 
-    def run_nginx(self):
-        name = "nginx_bench_%d" % (random.randint(1, 1000000))
-        cmd = "%s run --name=%s -p %d:%d %snginx" % (
-            self.docker,
-            name,
-            NGINX_PORT,
-            80,
-            self.registry,
-        )
-        print(cmd)
-        p = subprocess.Popen(cmd, shell=True)
-        while True:
-            try:
-                req = urllib.request.urlopen("http://localhost:%d" % NGINX_PORT)
-                req.close()
-                break
-            except:
-                time.sleep(0.01)  # wait 10ms
-                pass  # retry
-        cmd = "%s kill %s" % (self.docker, name)
-        rc = os.system(cmd)
-        assert rc == 0
-        p.wait()
+        print(runargs.stdin)
+        stdin = runargs.stdin + "\nexit\n"
+        p.communicate(stdin.encode())
+        end_run = datetime.now()
+        run_time = datetime.timestamp(end_run) - datetime.timestamp(start_run)
+        print("p.returncode:", p.returncode)
+        # assert(p.returncode == 0)
 
-    def run_iojs(self):
-        name = "iojs_bench_%d" % (random.randint(1, 1000000))
-        cmd = "%s run --name=%s -p %d:%d " % (self.docker, name, IOJS_PORT, 80)
-        a = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iojs")
-        a = tmp_copy(a)
-        b = "/src"
-        cmd += "-v %s:%s " % (a, b)
-        cmd += "%siojs iojs /src/index.js" % self.registry
-        print(cmd)
-        p = subprocess.Popen(cmd, shell=True)
-        while True:
-            try:
-                req = urllib.request.urlopen("http://localhost:%d" % IOJS_PORT)
-                print(req.read().strip())
-                req.close()
-                break
-            except:
-                time.sleep(0.01)  # wait 10ms
-                pass  # retry
-        cmd = "%s kill %s" % (self.docker, name)
-        rc = os.system(cmd)
-        assert rc == 0
-        p.wait()
+        print("Run time: %f s" % run_time)
 
-    def run_node(self):
-        name = "node_bench_%d" % (random.randint(1, 1000000))
-        cmd = "%s run --name=%s -p %d:%d " % (self.docker, name, NODE_PORT, 80)
-        a = os.path.join(os.path.dirname(os.path.abspath(__file__)), "node")
-        a = tmp_copy(a)
-        b = "/src"
-        cmd += "-v %s:%s " % (a, b)
-        cmd += "%snode node /src/index.js" % self.registry
-        print(cmd)
-        p = subprocess.Popen(cmd, shell=True)
-        while True:
-            try:
-                req = urllib.request.urlopen("http://localhost:%d" % NODE_PORT)
-                print(req.read().strip())
-                req.close()
-                break
-            except:
-                time.sleep(0.01)  # wait 10ms
-                pass  # retry
-        cmd = "%s kill %s" % (self.docker, name)
-        rc = os.system(cmd)
-        assert rc == 0
-        p.wait()
+        if self.cleanup:
+            self.clean_up(image_ref, container_id)
 
-    def run_registry(self):
-        name = "registry_bench_%d" % (random.randint(1, 1000000))
-        cmd = "%s run --name=%s -p %d:%d " % (self.docker, name, REGISTRY_PORT, 5000)
-        cmd += '-e GUNICORN_OPTS=["--preload"] '
-        cmd += "%sregistry" % self.registry
-        print(cmd)
-        p = subprocess.Popen(cmd, shell=True)
+        return pull_time, create_time, run_time
+
+    def run_cmd_url_wait(self, repo, runargs):
+        image_ref = self.image_ref(repo)
+        container_id = repo.replace(":", "-")
+
+        pull_cmd = self.pull_cmd(image_ref)
+        print(pull_cmd)
+
+        print("Pulling image %s ..." % image_ref)
+        with timer(pull_cmd) as time:
+            pull_time = time
+
+        create_cmd = self.create_cmd_url_wait_cmd(image_ref, container_id, runargs)
+        print(create_cmd)
+
+        print("Creating container for image %s ..." % image_ref)
+        with timer(create_cmd) as time:
+            create_time = time
+
+        run_cmd = self.task_start_cmd(container_id, iteration=False)
+        print(run_cmd)
+
+        print("Running container %s ..." % container_id)
+        start_run = datetime.now()
+
+        p = subprocess.Popen(run_cmd, shell=True)
         while True:
             try:
-                req = urllib.request.urlopen("http://localhost:%d" % REGISTRY_PORT)
-                print(req.read().strip())
+                req = urllib.request.urlopen(runargs.waitURL)
                 req.close()
                 break
             except:
                 time.sleep(0.01)  # wait 10ms
                 pass  # retry
-        cmd = "%s kill %s" % (self.docker, name)
-        rc = os.system(cmd)
-        assert rc == 0
-        p.wait()
+
+        end_run = datetime.now()
+        run_time = datetime.timestamp(end_run) - datetime.timestamp(start_run)
+
+        print("Run time: %f s" % run_time)
+
+        if self.cleanup:
+            self.clean_up(image_ref, container_id)
+
+        return pull_time, create_time, run_time
 
     def run(self, bench):
         repo = image_repo(bench.name)
         if repo in BenchRunner.ECHO_HELLO:
-            self.run_echo_hello(repo=bench.name)
+            return self.run_echo_hello(repo=bench.name)
         elif repo in BenchRunner.CMD_ARG:
-            self.run_cmd_arg(repo=bench.name, runargs=BenchRunner.CMD_ARG[repo])
+            return self.run_cmd_arg(repo=bench.name, runargs=BenchRunner.CMD_ARG[repo])
         elif repo in BenchRunner.CMD_ARG_WAIT:
-            self.run_cmd_arg_wait(
-                tagged=bench.name, runargs=BenchRunner.CMD_ARG_WAIT[repo]
+            return self.run_cmd_arg_wait(
+                repo=bench.name, runargs=BenchRunner.CMD_ARG_WAIT[repo]
             )
         elif repo in BenchRunner.CMD_STDIN:
-            self.run_cmd_stdin(repo=bench.name, runargs=BenchRunner.CMD_STDIN[repo])
-        elif repo in BenchRunner.CUSTOM:
-            fn = BenchRunner.__dict__[BenchRunner.CUSTOM[repo]]
-            fn(self)
+            return self.run_cmd_stdin(
+                repo=bench.name, runargs=BenchRunner.CMD_STDIN[repo]
+            )
+        elif repo in BenchRunner.CMD_URL_WAIT:
+            return self.run_cmd_url_wait(
+                repo=bench.name, runargs=BenchRunner.CMD_URL_WAIT[repo]
+            )
         else:
             print("Unknown bench: " + repo)
             exit(1)
 
+    def optimize(self, bench) -> str:
+        if self.optimizer is None:
+            print("optimizer is None")
+            exit(1)
+        os.makedirs(self.optimizer.accessed_files_dir, exist_ok=True)
+        repo = image_repo(bench.name)
+
+        if repo in BenchRunner.ECHO_HELLO:
+            optimize_cmd = self.optimizer.optimize_echo_hello_cmd(repo)
+            print(optimize_cmd)
+            rc = os.system(optimize_cmd)
+            return optimize_cmd
+        elif repo in BenchRunner.CMD_ARG:
+            optimize_cmd = self.optimizer.optimize_cmd_arg_cmd(repo)
+            print(optimize_cmd)
+            rc = os.system(optimize_cmd)
+            return optimize_cmd
+        elif repo in BenchRunner.CMD_STDIN:
+            optimize_cmd = self.optimizer.optimize_cmd_stdin_cmd(repo)
+            print(optimize_cmd)
+
+            rc = os.system(optimize_cmd)
+            return optimize_cmd
+        elif repo in BenchRunner.CMD_ARG_WAIT:
+            optimize_cmd = self.optimizer.optimize_cmd_arg_wait_cmd(repo)
+            print(optimize_cmd)
+            rc = os.system(optimize_cmd)
+            return optimize_cmd
+        elif repo in BenchRunner.CMD_URL_WAIT:
+            optimize_cmd = self.optimizer.optimize_cmd_url_wait_cmd(repo)
+            print(optimize_cmd)
+            rc = os.system(optimize_cmd)
+            return optimize_cmd
+        else:
+            print("Unknown bench: " + repo)
+            return ""
+
+    def pull_cmd(self, image_ref):
+        return f"nerdctl --snapshotter {self.snapshotter} pull {image_ref}"
+
+    def create_echo_hello_cmd(self, image_ref, container_id):
+        return f"nerdctl --snapshotter {self.snapshotter} create --net=host --name={container_id} {image_ref} -- echo hello"
+
+    def create_cmd_arg_cmd(self, image_ref, container_id, runargs):
+        cmd = f"nerdctl --snapshotter {self.snapshotter} create --net=host --name={container_id} {image_ref} "
+        return cmd + runargs.arg
+
+    def create_cmd_arg_wait_cmd(self, image_ref, container_id, runargs):
+        cmd = f"nerdctl --snapshotter {self.snapshotter} create --net=host "
+        if len(runargs.env) > 0:
+            env = " ".join(["--env %s=%s" % (k, v) for k, v in runargs.env.items()])
+            cmd += f" {env} "
+        for a, b in runargs.mount:
+            a = os.path.join(os.path.dirname(os.path.abspath(__file__)), a)
+            a = tmp_copy(a)
+            cmd += f"--volume {a}:{b} "
+        cmd += f"--name={container_id} {image_ref}"
+        if len(runargs.arg) > 0:
+            cmd += f" -- {runargs.arg} "
+
+        return cmd
+
+    def create_cmd_stdin_cmd(self, image_ref, container_id, runargs):
+        cmd = f"nerdctl --snapshotter {self.snapshotter} create --net=host "
+        for a, b in runargs.mount:
+            a = os.path.join(os.path.dirname(os.path.abspath(__file__)), a)
+            a = tmp_copy(a)
+            cmd += f"--volume {a}:{b} "
+        cmd += f"--name={container_id} {image_ref}"
+        if runargs.stdin_sh:
+            cmd += f" -- {runargs.stdin_sh}"  # e.g., sh -c
+        return cmd
+
+    def create_cmd_url_wait_cmd(self, image_ref, container_id, runargs):
+        cmd = f"nerdctl --snapshotter {self.snapshotter} create --net=host "
+        for a, b in runargs.mount:
+            a = os.path.join(os.path.dirname(os.path.abspath(__file__)), a)
+            a = tmp_copy(a)
+            cmd += f"--volume {a}:{b} "
+        if len(runargs.env) > 0:
+            env = " ".join([f"--env {k}={v}" for k, v in runargs.env.items()])
+            cmd += f" {env} "
+        cmd += f"--name={container_id} {image_ref}"
+        if len(runargs.arg) > 0:
+            cmd += f" -- {runargs.arg} "
+        return cmd
+
+    def task_start_cmd(self, container_id, iteration: bool):
+        if iteration:
+            return f"nerdctl --snapshotter {self.snapshotter} start -a {container_id}"
+        else:
+            return f"nerdctl --snapshotter {self.snapshotter} start {container_id}"
+
+    def task_kill_cmd(self, container_id):
+        return f"nerdctl --snapshotter {self.snapshotter} stop {container_id}"
+
+    def clean_up(self, image_ref, container_id):
+        print("Cleaning up environment for %s ..." % container_id)
+        cmd = self.task_kill_cmd(container_id)
+        print(cmd)
+        rc = os.system(cmd)  # sometimes containers already exit. we ignore the failure.
+        cmd = f"nerdctl --snapshotter {self.snapshotter} rm -f {container_id}"
+        print(cmd)
+        rc = os.system(cmd)
+        assert rc == 0
+        cmd = md = f"nerdctl --snapshotter {self.snapshotter} rmi -f {image_ref}"
+        print(cmd)
+        rc = os.system(cmd)
+        assert rc == 0
+
     def pull(self, bench):
-        cmd = "%s pull %s%s" % (self.docker, self.registry, bench.name)
+        cmd = f"{self.docker} pull {self.registry}{bench.name}"
         rc = os.system(cmd)
         assert rc == 0
 
     def push(self, bench):
-        cmd = "%s push %s%s" % (self.docker, self.registry, bench.name)
+        cmd = f"{self.docker} push {self.registry}{bench.name}"
         rc = os.system(cmd)
         assert rc == 0
 
@@ -583,7 +784,7 @@ class BenchRunner:
 
     def operation(self, op, bench):
         if op == "run":
-            self.run(bench)
+            return self.run(bench)
         elif op == "pull":
             self.pull(bench)
         elif op == "push":
@@ -662,6 +863,42 @@ def main():
         default="latest",
     )
 
+    parser.add_argument(
+        "--optimize",
+        type=bool,
+        choices=[True, False],
+        default=False,
+    )
+    parser.add_argument(
+        "--optimize-bin",
+        type=str,
+        default="/usr/local/bin/optimize",
+    )
+    parser.add_argument(
+        "--optimize-result-dir",
+        type=str,
+        dest="optimize_result_dir",
+        default="accessed_files",
+    )
+    parser.add_argument(
+        "--optimize-period",
+        type=int,
+        dest="optimize_period",
+        default=30,
+    )
+    parser.add_argument(
+        "--target-registry",
+        type=str,
+        dest="target_registry",
+        default="docker.io",
+    )
+    parser.add_argument(
+        "--cleanup",
+        type=bool,
+        choices=[True, False],
+        default=True,
+    )
+
     args = parser.parse_args()
 
     op = args.op
@@ -671,6 +908,11 @@ def main():
     all_supported_images = args.all_supported_images
     images_list = args.images_list
     snapshotter = args.snapshotter
+    optimize_bin = args.optimize_bin
+    result_dir = args.optimize_result_dir
+    target_registry = args.target_registry
+    period = args.optimize_period
+    cleanup = args.cleanup
 
     if all_supported_images:
         benches.extend(BenchRunner.ALL.values())
@@ -678,6 +920,7 @@ def main():
         for i in images_list:
             try:
                 bench = copy.deepcopy(BenchRunner.ALL[image_repo(i)])
+
                 tag = image_tag(i)
                 if tag is not None:
                     bench.set_tag(tag)
@@ -692,19 +935,127 @@ def main():
 
     # run benchmarks
     runner = BenchRunner(
-        docker=docker, registry=registry, registry2=registry2, snapshotter=snapshotter
+        docker=docker,
+        registry=registry,
+        registry2=registry2,
+        snapshotter=snapshotter,
+        optimizer=Optimize(
+            optimize_bin=optimize_bin,
+            accessed_files_dir=result_dir,
+            target=target_registry,
+            period=period,
+        )
+        if args.optimize
+        else None,
+        cleanup=cleanup,
     )
-    for bench in benches:
-        start = time.time()
-        runner.operation(op, bench)
-        elapsed = time.time() - start
 
-        row = {"repo": bench.repo, "bench": bench.name, "elapsed": elapsed}
+    # optimize image
+    if args.optimize:
+        for bench in benches:
+            print(runner.optimize(bench))
+        quit()
+
+    for bench in benches:
+        pull_time, create_time, run_time = runner.operation(op, bench)
+
+        row = {
+            "repo": bench.repo,
+            "bench": bench.name,
+            "pull_time": f"{pull_time: .6f}",
+            "create_time": f"{create_time: .6f}",
+            "run_time": f"{run_time: .6f}",
+            "elapsed": f"{pull_time + create_time + run_time: .6f}",
+        }
         js = json.dumps(row)
         print(js)
         f.write(js + "\n")
         f.flush()
     f.close()
+
+
+class Optimize:
+    def __init__(
+        self, optimize_bin="", accessed_files_dir="accessed_files", target="", period=30
+    ):
+        self.optimize_bin = optimize_bin
+        self.accessed_files_dir = accessed_files_dir
+        self.target = target
+        self.period = period
+
+    def optimize_echo_hello_cmd(self, repo):
+        args = "--args='[\"echo hello\"]'"
+        entry = '--entrypoint=\'["/bin/sh", "-c"]\''
+        return f"{self.optimize_bin} record --period={self.period} --file={self.accessed_files_dir}/{repo}.txt {entry} {args} {self.target}/{repo}:latest"
+
+    def optimize_cmd_arg_cmd(self, repo):
+        args = "--args='[\"%s\"]'" % BenchRunner.CMD_ARG[repo].arg.replace(
+            '"', '\\"'
+        ).replace("'", "'\"'\"'")
+        entry = '--entrypoint=\'["/bin/sh", "-c"]\''
+        return f"{self.optimize_bin} record --period={self.period} --file={self.accessed_files_dir}/{repo}.txt {entry} {args} {self.target}/{repo}:latest"
+
+    def optimize_cmd_stdin_cmd(self, repo):
+        args = "--args='[\"%s\"]'" % BenchRunner.CMD_STDIN[repo].stdin.replace(
+            "\\", "\\\\"
+        ).replace('"', '\\"').replace("'", "\\'")
+        entry = '--entrypoint=\'["/bin/sh", "-c"]\''
+        for a, b in BenchRunner.CMD_STDIN[repo].mount:
+            a = os.path.join(os.path.dirname(os.path.abspath(__file__)), a)
+            a = tmp_copy(a)
+            args += f" --mount type=bind,src={a},dst={b},options=rbind"
+
+        cmd = f"{self.optimize_bin} record --period={self.period} --file={self.accessed_files_dir}/{repo}.txt {entry} {args} {self.target}/{repo}:latest"
+
+        if BenchRunner.CMD_STDIN[repo].stdin_sh:
+            cmd += f" -- {BenchRunner.CMD_STDIN[repo].stdin_sh}"  # e.g., sh -c
+
+        return cmd
+
+    def optimize_cmd_arg_wait_cmd(self, repo):
+
+        entry = '--entrypoint=\'["/bin/sh", "-c"]\''
+        args = ""
+        if BenchRunner.CMD_ARG_WAIT[repo].arg != "":
+            args = args + "--args='[\"%s\"]'" % BenchRunner.CMD_ARG_WAIT[
+                repo
+            ].arg.replace('"', '\\"').replace("'", "'\"'\"'")
+        if len(BenchRunner.CMD_ARG_WAIT[repo].env) > 0:
+            env = " ".join(
+                [
+                    "-e %s=%s" % (k, v)
+                    for k, v in BenchRunner.CMD_ARG_WAIT[repo].env.items()
+                ]
+            )
+            args = args + " --env='[\"%s\"]'" % env.replace('"', '\\"').replace(
+                "'", "'\"'\"'"
+            )
+
+        return f"{self.optimize_bin} record --period={self.period} --file={self.accessed_files_dir}/{repo}.txt {entry} {args} {self.target}/{repo}:latest"
+
+    def optimize_cmd_url_wait_cmd(self, repo):
+        entry = '--entrypoint=\'["/bin/sh", "-c"]\''
+        args = ""
+        if BenchRunner.CMD_URL_WAIT[repo].arg != "":
+            args = args + "--args='[\"%s\"]'" % BenchRunner.CMD_URL_WAIT[
+                repo
+            ].arg.replace('"', '\\"').replace("'", "'\"'\"'")
+        if len(BenchRunner.CMD_URL_WAIT[repo].env) > 0:
+            env = " ".join(
+                [
+                    "-e %s=%s" % (k, v)
+                    for k, v in BenchRunner.CMD_URL_WAIT[repo].env.items()
+                ]
+            )
+            args = args + " --env='[\"%s\"]'" % env.replace('"', '\\"').replace(
+                "'", "'\"'\"'"
+            )
+        for a, b in BenchRunner.CMD_URL_WAIT[repo].mount:
+            a = os.path.join(os.path.dirname(os.path.abspath(__file__)), a)
+            a = tmp_copy(a)
+            args += f" --mount type=bind,src={a},dst={b},options=rbind"
+
+        return f"{self.optimize_bin} record --period={self.period} --file={self.accessed_files_dir}/{repo}.txt {entry} {args} {self.target}/{repo}:latest"
 
 
 if __name__ == "__main__":
